@@ -3,6 +3,7 @@ package filewalker_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -142,4 +143,94 @@ func TestWalkLimitInvalidLimit(t *testing.T) {
 	}, 0)
 
 	assert.Error(t, err, "Expected error for invalid limit")
+}
+
+func BenchmarkWalk(b *testing.B) {
+	tempDir := setupBenchmarkDir(b)
+	defer os.RemoveAll(tempDir)
+
+	// Simulate some I/O work
+	processFile := func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			// Simulate file processing work
+			time.Sleep(1 * time.Millisecond)
+
+			// Read a small portion of the file to simulate real I/O
+			if _, err := os.ReadFile(path); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	b.Run("Standard filepath.Walk", func(b *testing.B) {
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			err := filepath.Walk(tempDir, processFile)
+			require.NoError(b, err)
+		}
+	})
+
+	b.Run("Concurrent filewalker (2 workers)", func(b *testing.B) {
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			err := filewalker.WalkLimit(context.Background(), tempDir, processFile, 2)
+			require.NoError(b, err)
+		}
+	})
+
+	b.Run("Concurrent filewalker (4 workers)", func(b *testing.B) {
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			err := filewalker.WalkLimit(context.Background(), tempDir, processFile, 4)
+			require.NoError(b, err)
+		}
+	})
+
+	b.Run("Concurrent filewalker (8 workers)", func(b *testing.B) {
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			err := filewalker.WalkLimit(context.Background(), tempDir, processFile, 8)
+			require.NoError(b, err)
+		}
+	})
+}
+
+// setupBenchmarkDir creates a larger directory structure for benchmarking
+func setupBenchmarkDir(b *testing.B) string {
+	b.Helper()
+
+	tempDir, err := os.MkdirTemp("", "filewalker_bench")
+	require.NoError(b, err)
+
+	// Create a larger structure
+	depth := 5        // Increased depth
+	filesPerDir := 20 // More files per directory
+	createNestedDirs(b, tempDir, depth, filesPerDir)
+
+	return tempDir
+}
+
+func createNestedDirs(b *testing.B, dir string, depth int, filesPerDir int) {
+	if depth <= 0 {
+		return
+	}
+
+	// Create files in current directory
+	for i := 0; i < filesPerDir; i++ {
+		filename := filepath.Join(dir, fmt.Sprintf("file%d.txt", i))
+		err := os.WriteFile(filename, []byte("test content"), 0644)
+		require.NoError(b, err)
+	}
+
+	// Create and recurse into subdirectories
+	for i := 0; i < 3; i++ {
+		subdir := filepath.Join(dir, fmt.Sprintf("subdir%d", i))
+		err := os.Mkdir(subdir, 0755)
+		require.NoError(b, err)
+		createNestedDirs(b, subdir, depth-1, filesPerDir)
+	}
 }
