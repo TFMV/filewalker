@@ -1,5 +1,7 @@
 # filewalker
 
+*Inspired by [PowerWalk](https://github.com/stretchr/powerwalk)*
+
 Concurrent filesystem traversal with logging.
 
 Let me know if you find a bug or faster method.
