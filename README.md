@@ -2,6 +2,8 @@
 
 Concurrent filesystem traversal with logging.
 
+Let me know if you find a bug or faster method.
+
 ## Benchmark Results
 
 ### System Information
@@ -19,6 +21,34 @@ Concurrent filesystem traversal with logging.
 | **Concurrent `filewalker` (2 workers)**     | 1          | 1,480,638,334              | 4,684,624            | 26,227                   |
 | **Concurrent `filewalker` (4 workers)**     | 2          | 739,280,271                | 4,684,408            | 26,213                   |
 | **Concurrent `filewalker` (8 workers)**     | 3          | 366,615,250                | 4,685,226            | 26,215                   |
+
+## Usage
+
+Basic usage:
+
+```bash
+filewalker --workers=8 --format=json /path/to/scan
+```
+
+Available options:
+- `-w, --workers`: Number of concurrent workers (default: 4)
+- `--format`: Output format (text|json)
+- `-v, --verbose`: Enable verbose logging
+- `--silent`: Disable all output except errors
+- `-h, --help`: Show help message
+- `--version`: Show version
+
+Verbose scan with default (4) workers:
+
+```bash
+filewalker -v /home/user/projects
+```
+
+Silent scan with 16 workers:
+
+```bash
+filewalker --silent --workers=16 /path/to/scan
+```
 
 ## Author
 
