@@ -26,6 +26,18 @@ Let me know if you find a bug or faster method.
 
 ## Usage
 
+### As a Library
+
+```go
+import "github.com/TFMV/filewalker"
+// Use default concurrency
+err := filewalker.Walk(root, walkFn)
+// Or specify concurrent workers
+err := filewalker.WalkLimit(ctx, root, walkFn, workers)
+```
+
+### As a CLI
+
 Basic usage:
 
 ```bash
@@ -33,6 +45,7 @@ filewalker --workers=8 --format=json /path/to/scan
 ```
 
 Available options:
+
 - `-w, --workers`: Number of concurrent workers (default: 4)
 - `--format`: Output format (text|json)
 - `-v, --verbose`: Enable verbose logging
