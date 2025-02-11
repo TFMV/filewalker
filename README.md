@@ -46,14 +46,14 @@ filewalker --workers=8 --format=json /path/to/scan
 
 Available options:
 
-- `-w, --workers`: Number of concurrent workers (default: 4)
+- `-w, --workers`: Number of concurrent workers (default: CPU cores)
 - `--format`: Output format (text|json)
 - `-v, --verbose`: Enable verbose logging
 - `--silent`: Disable all output except errors
 - `-h, --help`: Show help message
 - `--version`: Show version
 
-Verbose scan with default (4) workers:
+Verbose scan with default (CPU cores) workers:
 
 ```bash
 filewalker -v /home/user/projects
