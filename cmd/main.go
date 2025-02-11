@@ -27,6 +27,13 @@ Options:
   -v --verbose             Enable verbose logging.
   --silent                 Disable all output except errors.
   --format=<fmt>           Output format (text|json) [default: text].
+  --min-size=<bytes>       Minimum file size to process.
+  --max-size=<bytes>       Maximum file size to process.
+  --pattern=<glob>         File pattern to match.
+  --exclude-dir=<dirs>     Directories to exclude (comma-separated).
+  --follow-symlinks        Follow symbolic links [default: false].
+  --progress              Show progress updates.
+  --error-mode=<mode>     Error handling mode (continue|stop|skip) [default: continue].
 `
 
 const version = "v0.1.0"
