@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -143,6 +144,134 @@ func TestWalkLimitInvalidLimit(t *testing.T) {
 	}, 0)
 
 	assert.Error(t, err, "Expected error for invalid limit")
+}
+
+// TestWalkLimitWithFilter verifies file filtering functionality
+func TestWalkLimitWithFilter(t *testing.T) {
+	tempDir := setupTestDir(t)
+	defer os.RemoveAll(tempDir)
+
+	tests := []struct {
+		name     string
+		filter   filewalker.FilterOptions
+		expected int32
+	}{
+		{
+			name: "Pattern filter",
+			filter: filewalker.FilterOptions{
+				Pattern: "file[1-2].txt",
+			},
+			expected: 2,
+		},
+		{
+			name: "Exclude directory",
+			filter: filewalker.FilterOptions{
+				ExcludeDir: []string{"subdir1"},
+			},
+			expected: 2, // Only file1.txt and subdir2/file4.txt
+		},
+		{
+			name: "Size filter",
+			filter: filewalker.FilterOptions{
+				MinSize: 1000,
+			},
+			expected: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var fileCount int32
+			walkFn := func(path string, info os.FileInfo, err error) error {
+				if err != nil {
+					return err
+				}
+				if !info.IsDir() {
+					atomic.AddInt32(&fileCount, 1)
+				}
+				return nil
+			}
+
+			err := filewalker.WalkLimitWithFilter(context.Background(), tempDir, walkFn, 2, tt.filter)
+			require.NoError(t, err)
+			assert.Equal(t, tt.expected, fileCount, "File count mismatch for %s", tt.name)
+		})
+	}
+}
+
+// TestWalkLimitWithProgress verifies progress reporting
+func TestWalkLimitWithProgress(t *testing.T) {
+	tempDir := setupTestDir(t)
+	defer os.RemoveAll(tempDir)
+
+	var lastStats filewalker.Stats
+	progressChan := make(chan struct{})
+	var once sync.Once
+	progressFn := func(stats filewalker.Stats) {
+		lastStats = stats
+		once.Do(func() {
+			close(progressChan) // Only close once
+		})
+	}
+
+	walkFn := func(path string, info os.FileInfo, err error) error {
+		require.NoError(t, err)
+		time.Sleep(10 * time.Millisecond)
+		return nil
+	}
+
+	err := filewalker.WalkLimitWithProgress(context.Background(), tempDir, walkFn, 2, progressFn)
+	require.NoError(t, err)
+
+	select {
+	case <-progressChan:
+		assert.True(t, lastStats.FilesProcessed > 0)
+		assert.True(t, lastStats.DirsProcessed > 0)
+	case <-time.After(time.Second):
+		t.Fatal("Timeout waiting for progress update")
+	}
+}
+
+// TestWalkLimitWithOptions verifies WalkOptions functionality
+func TestWalkLimitWithOptions(t *testing.T) {
+	tempDir := setupTestDir(t)
+	defer os.RemoveAll(tempDir)
+
+	var stats filewalker.Stats
+	progressChan := make(chan struct{})
+	var once sync.Once
+	opts := filewalker.WalkOptions{
+		ErrorHandling: filewalker.ErrorHandlingContinue,
+		Filter: filewalker.FilterOptions{
+			Pattern: "*.txt",
+		},
+		Progress: func(s filewalker.Stats) {
+			stats = s
+			if s.ErrorCount > 0 {
+				once.Do(func() {
+					close(progressChan)
+				})
+			}
+		},
+		BufferSize: 10,
+	}
+
+	walkFn := func(path string, info os.FileInfo, err error) error {
+		if filepath.Base(path) == "file2.txt" {
+			return errors.New("test error")
+		}
+		return nil
+	}
+
+	err := filewalker.WalkLimitWithOptions(context.Background(), tempDir, walkFn, opts)
+	require.NoError(t, err) // Should continue on errors
+
+	select {
+	case <-progressChan:
+		assert.True(t, stats.ErrorCount > 0, "Expected error count to be greater than 0")
+	case <-time.After(time.Second):
+		t.Fatal("Timeout waiting for error to be reported")
+	}
 }
 
 func BenchmarkWalk(b *testing.B) {
