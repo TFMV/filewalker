@@ -15,6 +15,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/TFMV/filewalker"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 // setupTestDir creates a temporary directory structure for testing.
@@ -361,5 +363,155 @@ func createNestedDirs(b *testing.B, dir string, depth int, filesPerDir int) {
 		err := os.Mkdir(subdir, 0755)
 		require.NoError(b, err)
 		createNestedDirs(b, subdir, depth-1, filesPerDir)
+	}
+}
+
+func TestSymlinkCycleDetection(t *testing.T) {
+	tempDir := setupTestDir(t)
+	defer os.RemoveAll(tempDir)
+
+	// Create a cyclic symlink structure
+	err := os.Symlink(filepath.Join(tempDir, "link2"), filepath.Join(tempDir, "link1"))
+	require.NoError(t, err)
+	err = os.Symlink(filepath.Join(tempDir, "link1"), filepath.Join(tempDir, "link2"))
+	require.NoError(t, err)
+
+	var visitedPaths []string
+	walkFn := func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		visitedPaths = append(visitedPaths, path)
+		return nil
+	}
+
+	opts := filewalker.WalkOptions{
+		SymlinkHandling: filewalker.SymlinkFollow,
+		ErrorHandling:   filewalker.ErrorHandlingContinue,
+	}
+
+	err = filewalker.WalkLimitWithOptions(context.Background(), tempDir, walkFn, opts)
+	require.NoError(t, err)
+
+	// Verify we didn't get stuck in a cycle
+	for _, path := range visitedPaths {
+		count := 0
+		for _, p := range visitedPaths {
+			if p == path {
+				count++
+			}
+		}
+		assert.LessOrEqual(t, count, 1, "Path visited multiple times: %s", path)
+	}
+}
+
+func TestWalkLimitMultipleErrors(t *testing.T) {
+	tempDir := setupTestDir(t)
+	defer os.RemoveAll(tempDir)
+
+	// Create walkFn that generates multiple errors
+	walkFn := func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			base := filepath.Base(path)
+			switch base {
+			case "file1.txt":
+				return errors.New("error1")
+			case "file2.txt":
+				return errors.New("error2")
+			}
+		}
+		return nil
+	}
+
+	err := filewalker.WalkLimit(context.Background(), tempDir, walkFn, 2)
+	require.Error(t, err)
+
+	// Verify both errors are present
+	errStr := err.Error()
+	assert.Contains(t, errStr, "error1")
+	assert.Contains(t, errStr, "error2")
+}
+
+func TestLogLevels(t *testing.T) {
+	tempDir := setupTestDir(t)
+	defer os.RemoveAll(tempDir)
+
+	// Create an in-memory logger for testing
+	core, recorded := observer.New(zap.DebugLevel)
+	logger := zap.New(core)
+
+	opts := filewalker.WalkOptions{
+		Logger:   logger,
+		LogLevel: filewalker.LogLevelDebug,
+		Progress: func(stats filewalker.Stats) {},
+		Filter: filewalker.FilterOptions{
+			Pattern: "*.txt",
+		},
+	}
+
+	err := filewalker.WalkLimitWithOptions(context.Background(), tempDir, func(path string, info os.FileInfo, err error) error {
+		return nil
+	}, opts)
+	require.NoError(t, err)
+
+	// Verify debug logs were recorded
+	entries := recorded.All()
+	assert.Greater(t, len(entries), 0, "Expected debug logs to be recorded")
+	assert.Contains(t, entries[0].Message, "starting walk with options")
+}
+
+func TestWalkLimitWithProgressExtendedStats(t *testing.T) {
+	tempDir := setupTestDir(t)
+	defer os.RemoveAll(tempDir)
+
+	// Clean the directory first
+	err := os.RemoveAll(tempDir)
+	require.NoError(t, err)
+	err = os.MkdirAll(tempDir, 0755)
+	require.NoError(t, err)
+
+	// Create exactly 5 files with known sizes
+	for i := 0; i < 5; i++ {
+		filename := filepath.Join(tempDir, fmt.Sprintf("testfile%d.dat", i))
+		data := make([]byte, 1024*1024) // 1MB files
+		err := os.WriteFile(filename, data, 0644)
+		require.NoError(t, err)
+	}
+
+	var lastStats filewalker.Stats
+	progressChan := make(chan struct{})
+	var once sync.Once
+	progressFn := func(stats filewalker.Stats) {
+		lastStats = stats
+		if stats.FilesProcessed == 5 { // Wait for exactly 5 files
+			once.Do(func() {
+				close(progressChan)
+			})
+		}
+	}
+
+	walkFn := func(path string, info os.FileInfo, err error) error {
+		require.NoError(t, err)
+		if !info.IsDir() {
+			require.Equal(t, int64(1024*1024), info.Size(), "All test files should be exactly 1MB")
+			time.Sleep(10 * time.Millisecond) // Ensure we have measurable elapsed time
+		}
+		return nil
+	}
+
+	err = filewalker.WalkLimitWithProgress(context.Background(), tempDir, walkFn, 2, progressFn)
+	require.NoError(t, err)
+
+	select {
+	case <-progressChan:
+		assert.Equal(t, int64(5), lastStats.FilesProcessed, "Should process exactly 5 files")
+		assert.Equal(t, int64(1024*1024), lastStats.AvgFileSize, "Expected average file size of 1MB")
+		assert.Greater(t, lastStats.SpeedMBPerSec, float64(0), "Expected non-zero processing speed")
+		assert.LessOrEqual(t, lastStats.SpeedMBPerSec, float64(1024), "Speed should not exceed 1GB/s")
+	case <-time.After(time.Second):
+		t.Fatal("Timeout waiting for progress update")
 	}
 }
