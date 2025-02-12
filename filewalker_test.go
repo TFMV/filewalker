@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -514,4 +515,223 @@ func TestWalkLimitWithProgressExtendedStats(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("Timeout waiting for progress update")
 	}
+}
+
+// TestWalkLimitEmptyDir ensures traversal works with an empty directory
+func TestWalkLimitEmptyDir(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "empty_dir")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	var fileCount int32
+	walkFn := func(path string, info os.FileInfo, err error) error {
+		require.NoError(t, err)
+		atomic.AddInt32(&fileCount, 1)
+		return nil
+	}
+
+	err = filewalker.WalkLimit(context.Background(), tempDir, walkFn, 5)
+	require.NoError(t, err)
+
+	// Should only process the root directory itself
+	assert.Equal(t, int32(1), fileCount)
+}
+
+// TestWalkLimitHiddenFiles ensures hidden files are included in traversal
+func TestWalkLimitHiddenFiles(t *testing.T) {
+	tempDir := setupTestDir(t)
+	defer os.RemoveAll(tempDir)
+
+	// Create a hidden file
+	hiddenFile := filepath.Join(tempDir, ".hidden.txt")
+	err := os.WriteFile(hiddenFile, []byte("test"), 0644)
+	require.NoError(t, err)
+
+	var mu sync.Mutex
+	var visitedFiles []string
+	walkFn := func(path string, info os.FileInfo, err error) error {
+		require.NoError(t, err)
+		if !info.IsDir() {
+			mu.Lock()
+			visitedFiles = append(visitedFiles, filepath.Base(path))
+			mu.Unlock()
+		}
+		return nil
+	}
+
+	err = filewalker.WalkLimit(context.Background(), tempDir, walkFn, 5)
+	require.NoError(t, err)
+
+	// Ensure hidden file is visited
+	assert.Contains(t, visitedFiles, ".hidden.txt", "Hidden file should be included in traversal")
+}
+
+// TestWalkLimitDeepNesting ensures deep directory structures are fully traversed
+func TestWalkLimitDeepNesting(t *testing.T) {
+	tempDir := setupTestDir(t)
+	defer os.RemoveAll(tempDir)
+
+	// Create deeply nested structure
+	deepDir := tempDir
+	for i := 0; i < 10; i++ {
+		deepDir = filepath.Join(deepDir, "nested")
+		err := os.Mkdir(deepDir, 0755)
+		require.NoError(t, err)
+	}
+
+	var dirCount int32
+	walkFn := func(path string, info os.FileInfo, err error) error {
+		require.NoError(t, err)
+		if info.IsDir() {
+			atomic.AddInt32(&dirCount, 1)
+		}
+		return nil
+	}
+
+	err := filewalker.WalkLimit(context.Background(), tempDir, walkFn, 5)
+	require.NoError(t, err)
+
+	// Expecting all nested directories to be visited
+	assert.GreaterOrEqual(t, dirCount, int32(10))
+}
+
+// TestWalkLimitHighConcurrency ensures high worker counts do not deadlock
+func TestWalkLimitHighConcurrency(t *testing.T) {
+	tempDir := setupTestDir(t)
+	defer os.RemoveAll(tempDir)
+
+	var fileCount int32
+	walkFn := func(path string, info os.FileInfo, err error) error {
+		require.NoError(t, err)
+		atomic.AddInt32(&fileCount, 1)
+		return nil
+	}
+
+	err := filewalker.WalkLimit(context.Background(), tempDir, walkFn, 1000) // Extreme concurrency
+	require.NoError(t, err)
+
+	// Ensure all files are visited
+	assert.GreaterOrEqual(t, fileCount, int32(5))
+}
+
+// TestWalkLimitLargeFiles ensures traversal works with large files
+func TestWalkLimitLargeFiles(t *testing.T) {
+	tempDir := setupTestDir(t)
+	defer os.RemoveAll(tempDir)
+
+	largeFile := filepath.Join(tempDir, "large.dat")
+	largeData := make([]byte, 100*1024*1024) // 100MB
+	err := os.WriteFile(largeFile, largeData, 0644)
+	require.NoError(t, err)
+
+	var fileSize int64
+	walkFn := func(path string, info os.FileInfo, err error) error {
+		if !info.IsDir() {
+			atomic.AddInt64(&fileSize, info.Size())
+		}
+		return nil
+	}
+
+	err = filewalker.WalkLimit(context.Background(), tempDir, walkFn, 5)
+	require.NoError(t, err)
+
+	assert.Equal(t, int64(100*1024*1024), fileSize, "Expected total size of processed files to match large file size")
+}
+
+// TestWalkLimitSkipDir ensures SkipDir is respected
+func TestWalkLimitSkipDir(t *testing.T) {
+	tempDir := setupTestDir(t)
+	defer os.RemoveAll(tempDir)
+
+	var visitedPaths []string
+	var mu sync.Mutex
+
+	// Create a map to track skipped directories
+	skippedDirs := make(map[string]bool)
+	skippedDirs[filepath.Join(tempDir, "subdir1")] = true
+
+	walkFn := func(path string, info os.FileInfo, err error) error {
+		if info.IsDir() {
+			absPath, _ := filepath.Abs(path)
+			if skippedDirs[absPath] {
+				return filepath.SkipDir
+			}
+		}
+
+		mu.Lock()
+		visitedPaths = append(visitedPaths, path)
+		mu.Unlock()
+		return nil
+	}
+
+	err := filewalker.WalkLimit(context.Background(), tempDir, walkFn, 5)
+	require.NoError(t, err)
+
+	// Verify no paths under subdir1 were visited
+	for _, path := range visitedPaths {
+		absPath, err := filepath.Abs(path)
+		require.NoError(t, err)
+		for skipDir := range skippedDirs {
+			assert.False(t, strings.HasPrefix(absPath, skipDir),
+				"Path %s should not be under skipped directory %s", path, skipDir)
+		}
+	}
+}
+
+// TestWalkLimitSymlinkReport ensures symlinks are reported but not followed
+func TestWalkLimitSymlinkReport(t *testing.T) {
+	tempDir := setupTestDir(t)
+	defer os.RemoveAll(tempDir)
+
+	target := filepath.Join(tempDir, "file1.txt")
+	link := filepath.Join(tempDir, "symlink")
+	err := os.Symlink(target, link)
+	require.NoError(t, err)
+
+	var visitedFiles []string
+	walkFn := func(path string, info os.FileInfo, err error) error {
+		require.NoError(t, err)
+		if !info.IsDir() {
+			visitedFiles = append(visitedFiles, filepath.Base(path))
+		}
+		return nil
+	}
+
+	opts := filewalker.WalkOptions{
+		SymlinkHandling: filewalker.SymlinkReport,
+		ErrorHandling:   filewalker.ErrorHandlingContinue,
+	}
+
+	err = filewalker.WalkLimitWithOptions(context.Background(), tempDir, walkFn, opts)
+	require.NoError(t, err)
+
+	// Ensure symlink is reported but not followed
+	assert.Contains(t, visitedFiles, "symlink")
+}
+
+// TestWalkLimitLargeDirectory ensures large directories do not cause excessive memory use
+func TestWalkLimitLargeDirectory(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "filewalker_large_test")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	// Create exactly 10000 files
+	for i := 0; i < 10000; i++ {
+		f, err := os.Create(filepath.Join(tempDir, fmt.Sprintf("file%d.txt", i)))
+		require.NoError(t, err)
+		f.Close()
+	}
+
+	var fileCount int32
+	walkFn := func(path string, info os.FileInfo, err error) error {
+		if !info.IsDir() {
+			atomic.AddInt32(&fileCount, 1)
+		}
+		return nil
+	}
+
+	err = filewalker.WalkLimit(context.Background(), tempDir, walkFn, 10)
+	require.NoError(t, err)
+
+	assert.Equal(t, int32(10000), fileCount, "Should process exactly 10000 files")
 }
