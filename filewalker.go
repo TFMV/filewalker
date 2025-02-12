@@ -43,17 +43,18 @@ type Stats struct {
 // updateDerivedStats calculates derived statistics like averages and speeds.
 func (s *Stats) updateDerivedStats() {
 	filesProcessed := atomic.LoadInt64(&s.FilesProcessed)
+	bytesProcessed := atomic.LoadInt64(&s.BytesProcessed)
+
 	if filesProcessed > 0 {
-		bytesProcessed := atomic.LoadInt64(&s.BytesProcessed)
 		s.AvgFileSize = bytesProcessed / filesProcessed
-		elapsedSec := s.ElapsedTime.Seconds()
-		if elapsedSec > 0 {
-			megabytes := float64(bytesProcessed) / (1024.0 * 1024.0)
-			s.SpeedMBPerSec = megabytes / elapsedSec
-			if s.SpeedMBPerSec > 1024.0 {
-				s.SpeedMBPerSec = 1024.0
-			}
-		}
+	}
+
+	elapsedSec := s.ElapsedTime.Seconds()
+	if elapsedSec > 0 && bytesProcessed > 0 {
+		megabytes := float64(bytesProcessed) / (1024.0 * 1024.0)
+		s.SpeedMBPerSec = megabytes / elapsedSec
+	} else {
+		s.SpeedMBPerSec = 0
 	}
 }
 
@@ -393,6 +394,7 @@ func WalkLimitWithOptions(ctx context.Context, root string, walkFn filepath.Walk
 			if opts.Progress != nil {
 				atomic.AddInt64(&stats.ErrorCount, 1)
 				stats.ElapsedTime = time.Since(startTime)
+				stats.updateDerivedStats()
 				opts.Progress(*stats)
 			}
 			switch opts.ErrorHandling {
@@ -425,6 +427,7 @@ func WalkLimitWithOptions(ctx context.Context, root string, walkFn filepath.Walk
 				atomic.AddInt64(&stats.BytesProcessed, info.Size())
 			}
 			stats.ElapsedTime = time.Since(startTime)
+			stats.updateDerivedStats()
 			opts.Progress(*stats)
 		}
 
@@ -433,6 +436,7 @@ func WalkLimitWithOptions(ctx context.Context, root string, walkFn filepath.Walk
 			if opts.Progress != nil {
 				atomic.AddInt64(&stats.ErrorCount, 1)
 				stats.ElapsedTime = time.Since(startTime)
+				stats.updateDerivedStats()
 				opts.Progress(*stats)
 			}
 			switch opts.ErrorHandling {
