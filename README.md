@@ -150,18 +150,6 @@ Filewalker is fully thread-safe, designed for high-performance concurrent traver
 - Worker pool model ensures safe concurrent processing.
 - Context cancellation cleanly stops all workers.
 
-## 🛑 Error Handling
-
-Filewalker provides robust error management with three modes:
-
-| Mode | Behavior |
-|------|----------|
-| **Continue** | Skip errors, process remaining files |
-| **Stop** | Halt immediately on first error |
-| **Skip** | Ignore problematic files & directories |
-
-Errors are collected and combined using errors.Join() for detailed reporting.
-
 ## 📦 Installation
 
 ```bash
@@ -235,7 +223,7 @@ for i := 0; i < limit; i++ {
   - Files Processed
   - Processing Speed (MB/s)
   - Elapsed Time
-- Error Count
+  - Error Count
 
 ## License
 
