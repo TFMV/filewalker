@@ -4,6 +4,8 @@ A high-performance concurrent filesystem traversal library with filtering, progr
 
 ## 🚀 Features
 
+Who doesn't need to walk a directory tree using a producer-consumer model with industrial-strength error handling, configurable logging, and progress monitoring?
+
 ### 🔄 **Fast Parallel Processing**
 
 - Up to **8x faster** than `filepath.Walk`
@@ -56,10 +58,12 @@ Filewalker significantly outperforms `filepath.Walk` by using concurrent workers
 
 | Workers  | Time (ns/op)  | Throughput (MB/s) | Speedup |
 |----------|-------------|----------------|---------|
-| `filepath.Walk` | 3,382,554,791 | ~50 MB/s  | baseline |
-| **2 workers**   | 1,633,955,120 | ~105 MB/s | 2.1x faster |
-| **4 workers**   | 787,345,711   | ~220 MB/s | 4.3x faster |
-| **8 workers**   | 383,809,679   | ~450 MB/s | 8.8x faster |
+| `filepath.Walk` | 3,192,416,229 | ~54 MB/s  | baseline |
+| **2 workers**   | 1,557,652,298 | ~110 MB/s | 2.05x faster |
+| **4 workers**   | 768,225,614   | ~225 MB/s | 4.21x faster |
+| **8 workers**   | 372,091,401   | ~465 MB/s | 8.65x faster |
+
+> Benchmarks run on Apple M2 Pro (10 cores)
 
 ### 🛠 **Benchmark Setup**
 
