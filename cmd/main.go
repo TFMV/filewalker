@@ -6,6 +6,7 @@ import (
 	"os"
 	"runtime"
 	"strconv"
+	"time"
 
 	"github.com/docopt/docopt-go"
 	"go.uber.org/zap"
@@ -76,6 +77,31 @@ func main() {
 		size  int64
 	}
 
+	var lastUpdate time.Time
+	progressFn := func(stats filewalker.Stats) {
+		if time.Since(lastUpdate) < 100*time.Millisecond {
+			return
+		}
+		lastUpdate = time.Now()
+
+		fmt.Printf("\r\033[K")
+
+		if cfg.format == "json" {
+			fmt.Printf(`{"files":%d,"dirs":%d,"bytes":%d,"speed":"%.2f MB/s","elapsed":"%s"}`,
+				stats.FilesProcessed,
+				stats.DirsProcessed,
+				stats.BytesProcessed,
+				stats.SpeedMBPerSec,
+				stats.ElapsedTime.Round(time.Millisecond))
+		} else {
+			fmt.Printf("Files: %d | Dirs: %d | Speed: %.2f MB/s | Elapsed: %s",
+				stats.FilesProcessed,
+				stats.DirsProcessed,
+				stats.SpeedMBPerSec,
+				stats.ElapsedTime.Round(time.Millisecond))
+		}
+	}
+
 	// Create the walk function
 	walkFn := func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -85,13 +111,7 @@ func main() {
 			return err
 		}
 
-		if info.IsDir() {
-			stats.dirs++
-		} else {
-			stats.files++
-			stats.size += info.Size()
-		}
-
+		// Let filewalker handle the stats - remove our custom stats tracking
 		if cfg.verbose {
 			logger.Info("Visited",
 				zap.String("path", path),
@@ -102,15 +122,34 @@ func main() {
 		return nil
 	}
 
+	// Create walk options with progress and error handling
+	walkOpts := filewalker.WalkOptions{
+		Progress:      progressFn,
+		BufferSize:    cfg.workers,
+		ErrorHandling: filewalker.ErrorHandlingContinue,
+		Filter: filewalker.FilterOptions{
+			MinSize:    0,          // No minimum size
+			MaxSize:    0,          // No maximum size
+			Pattern:    "",         // Match all files
+			ExcludeDir: []string{}, // Don't exclude any dirs
+		},
+		SymlinkHandling: filewalker.SymlinkFollow, // Follow symlinks
+		Logger:          logger,
+		LogLevel:        filewalker.LogLevelInfo,
+	}
+
 	// Execute the walk
 	logger.Info("Starting file walk",
 		zap.String("path", cfg.path),
 		zap.Int("workers", cfg.workers))
 
-	if err := filewalker.WalkLimit(ctx, cfg.path, walkFn, cfg.workers); err != nil {
+	if err := filewalker.WalkLimitWithOptions(ctx, cfg.path, walkFn, walkOpts); err != nil {
+		fmt.Printf("\n") // New line after progress
 		logger.Error("Walk failed", zap.Error(err))
 		os.Exit(1)
 	}
+
+	fmt.Printf("\n") // New line after progress
 
 	// Output results
 	if !cfg.silent {
