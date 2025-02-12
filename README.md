@@ -75,6 +75,18 @@ Filewalker significantly outperforms `filepath.Walk` by using concurrent workers
 
 ## 🛠 Usage
 
+### CLI Usage
+
+```bash
+filewalker --path /path/to/directory --workers 4 --format json --verbose
+```
+
+You will see output like the following:
+
+```json
+{"files":108250,"dirs":19788,"bytes":3684178241,"speed":"1032.07 MB/s","elapsed":"3.404s"}
+```
+
 ### 🔹 **Basic Usage**
 
 ```go
