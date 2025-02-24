@@ -4,29 +4,12 @@ A high-performance concurrent filesystem traversal library with filtering, progr
 
 ## 🚀 Features
 
-Who doesn't need to walk a directory tree using a producer-consumer model with industrial-strength error handling, configurable logging, and progress monitoring?
-
-### 🔄 **Fast Parallel Processing**
-
-- Up to **8x faster** than `filepath.Walk`
-- Configurable **worker pool** for parallel traversal
-- Automatic **CPU core detection** for efficiency
-
-### 📊 **Real-Time Progress Monitoring**
-
-- Tracks **files, directories, and bytes processed**
-- **Processing speed (MB/s) & average file size**
-- Live **error count & elapsed time**
-- Customizable **progress callback**
-
-### 🔍 **Advanced Filtering**
-
-- File size limits: `MinSize`, `MaxSize`
-- Modification time ranges: `ModifiedAfter`, `ModifiedBefore`
-- **Glob pattern matching**: `Pattern: "*.go"`
-- Directory exclusion: `ExcludeDir: []string{"vendor"}`
-- File type filtering: `IncludeTypes: []string{".log", ".csv"}`
-- Parent directory filtering for deeper control
+- Concurrency: Parallel traversal for massive speed improvements over filepath.Walk.
+- Real-Time Progress: Live tracking of processed files, directories, and throughput.
+- Filtering: Control file selection based on size, modification time, patterns, and more.
+- Error Handling: Configurable behavior for skipping, continuing, or stopping on errors.
+- Symlink Handling: Options to follow, ignore, or report symbolic links.
+- Logging: Structured logging via zap with adjustable verbosity.
 
 ### ⚠️ **Robust Error Handling**
 
@@ -73,106 +56,88 @@ Filewalker significantly outperforms `filepath.Walk` by using concurrent workers
 
 ---
 
-## 🛠 Usage
-
-### CLI Usage
-
-```bash
-filewalker --path /path/to/directory --workers 4 --format json --verbose
-```
-
-You will see output like the following:
-
-```json
-{"files":108250,"dirs":19788,"bytes":3684178241,"speed":"1032.07 MB/s","elapsed":"3.404s"}
-```
-
-### 🔹 **Basic Usage**
-
-```go
-err := filewalker.Walk(root, walkFn)
-progressFn := func(stats filewalker.Stats) {
-    fmt.Printf("Files: %d | Speed: %.2f MB/s | Errors: %d | Elapsed: %s\n",
-        stats.FilesProcessed,
-        stats.SpeedMBPerSec,
-        stats.ErrorCount,
-        stats.ElapsedTime.Round(time.Millisecond),
-    )
-}
-err := filewalker.WalkLimitWithProgress(ctx, root, walkFn, workers, progressFn)
-```
-
-### 🔹 With Progress Monitoring
-
-```go
-progressFn := func(stats filewalker.Stats) {
-    fmt.Printf("Files: %d | Speed: %.2f MB/s | Errors: %d | Elapsed: %s\n",
-        stats.FilesProcessed,
-        stats.SpeedMBPerSec,
-        stats.ErrorCount,
-        stats.ElapsedTime.Round(time.Millisecond),
-    )
-}
-err := filewalker.WalkLimitWithProgress(ctx, root, walkFn, workers, progressFn)
-```
-
-### 🔹 With Filtering
-
-```go
-filter := filewalker.FilterOptions{
-    MinSize: 1 * 1024,          // Min 1 KB
-    MaxSize: 100 * 1024 * 1024, // Max 100 MB
-    Pattern: "*.go",
-    ExcludeDir: []string{"vendor", "node_modules"},
-    ModifiedAfter: time.Now().AddDate(-1, 0, 0), // Only files modified in the last year
-}
-err := filewalker.WalkLimitWithFilter(ctx, root, walkFn, workers, filter)
-```
-
-### 🔹 With Logging
-
-```go
-filewalker.SetLogger(zap.NewExample())
-```
-
-### Full Configuration
-
-```go
-opts := filewalker.WalkOptions{
-    ErrorHandling: filewalker.ErrorHandlingContinue,
-    Filter: filewalker.FilterOptions{
-        MinSize: 1024,
-        Pattern: "*.go",
-        ExcludeDir: []string{"vendor"},
-    },
-    Progress: progressFn,
-    LogLevel: filewalker.LogLevelDebug,
-    BufferSize: 100,
-    SymlinkHandling: filewalker.SymlinkIgnore,
-}
-err := filewalker.WalkLimitWithOptions(ctx, root, walkFn, opts)
-```
-
-## 🧵 Thread Safety
-
-Filewalker is fully thread-safe, designed for high-performance concurrent traversal:
-
-- Uses atomic counters for real-time statistics tracking.
-- Caches results in sync.Map to prevent redundant operations.
-- Worker pool model ensures safe concurrent processing.
-- Context cancellation cleanly stops all workers.
-
-## 📦 Installation
-
-```bash
-go get github.com/TFMV/filewalker
-```
-
 ## 🏗 Architecture
 
 ### Performance Design
 
-Filewalker achieves high performance through several key architectural decisions:
+Filewalker achieves high performance through several key architectural decisions.
+
+### 📊 Architecture Diagram
+
+```mermaid
+graph TB
+    subgraph Input
+        Root[Root Directory]
+    end
+
+    subgraph Producer
+        Walk[filepath.Walk]
+        Cache[Directory Cache]
+        Walk --> Cache
+    end
+
+    subgraph TaskQueue
+        Channel[Buffered Channel<br>size=workers]
+    end
+
+    subgraph WorkerPool
+        W1[Worker 1]
+        W2[Worker 2]
+        W3[Worker 3]
+        WN[Worker N]
+    end
+
+    subgraph Statistics
+        Atomic[Atomic Counters]
+        Progress[Progress Monitor]
+        Speed[Speed Calculator]
+    end
+
+    subgraph ErrorHandling
+        ErrContinue[Continue Mode]
+        ErrStop[Stop Mode]
+        ErrSkip[Skip Mode]
+        ErrCollector[Error Collector]
+    end
+
+    Root --> Walk
+    Cache --> Channel
+    Channel --> W1
+    Channel --> W2
+    Channel --> W3
+    Channel --> WN
+    
+    W1 --> Atomic
+    W2 --> Atomic
+    W3 --> Atomic
+    WN --> Atomic
+    
+    Atomic --> Progress
+    Progress --> Speed
+    
+    W1 --> ErrCollector
+    W2 --> ErrCollector
+    W3 --> ErrCollector
+    WN --> ErrCollector
+    
+    ErrCollector --> ErrContinue
+    ErrCollector --> ErrStop
+    ErrCollector --> ErrSkip
+
+    classDef default fill:#f9f,stroke:#333,stroke-width:2px;
+    classDef producer fill:#bbf,stroke:#333,stroke-width:2px;
+    classDef queue fill:#bfb,stroke:#333,stroke-width:2px;
+    classDef workers fill:#fbf,stroke:#333,stroke-width:2px;
+    classDef stats fill:#ffb,stroke:#333,stroke-width:2px;
+    classDef errors fill:#fbb,stroke:#333,stroke-width:2px;
+
+    class Root default;
+    class Walk,Cache producer;
+    class Channel queue;
+    class W1,W2,W3,WN workers;
+    class Atomic,Progress,Speed stats;
+    class ErrContinue,ErrStop,ErrSkip,ErrCollector errors;
+```
 
 #### 1. Worker Pool Model
 
