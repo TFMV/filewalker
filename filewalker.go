@@ -8,16 +8,21 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
@@ -27,17 +32,21 @@ import (
 // --------------------------------------------------------------------------
 
 type FileEvent struct {
-	Path          string      `json:"path"`
-	Hash          string      `json:"hash"`
-	Size          int64       `json:"size"`
-	Mode          os.FileMode `json:"mode"`
-	ModTime       time.Time   `json:"mod_time"`
-	Suspicious    bool        `json:"suspicious"`
-	Reason        string      `json:"reason"`
-	Timestamp     time.Time   `json:"timestamp"`
-	User          string      `json:"user,omitempty"`           // User who owns the file (if available)
-	Process       string      `json:"process,omitempty"`        // Process associated to the file (if available) - Requires more advanced monitoring
-	ParentProcess string      `json:"parent_process,omitempty"` // Useful in advanced investigations
+	Path           string      `json:"path"`
+	Hash           string      `json:"hash"`
+	Size           int64       `json:"size"`
+	Mode           os.FileMode `json:"mode"`
+	ModTime        time.Time   `json:"mod_time"`
+	Suspicious     bool        `json:"suspicious"`
+	Reason         string      `json:"reason"`
+	Timestamp      time.Time   `json:"timestamp"`
+	User           string      `json:"user,omitempty"`            // User who owns the file (if available)
+	Process        string      `json:"process,omitempty"`         // Process associated to the file (if available) - Requires more advanced monitoring
+	ParentProcess  string      `json:"parent_process,omitempty"`  // Useful in advanced investigations
+	PID            int         `json:"pid,omitempty"`             // Process ID that modified the file
+	PPID           int         `json:"ppid,omitempty"`            // Parent Process ID
+	CmdLine        string      `json:"cmdline,omitempty"`         // Full command line of the process
+	NetConnections []string    `json:"net_connections,omitempty"` // Network connections associated with the process
 }
 
 // Global alert store (with improved concurrency handling).
@@ -266,6 +275,50 @@ func computeFileHash(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// computeFastFileHash computes a SHA-256 hash of the first and last 1MB chunks of a file
+// This is much faster than hashing the entire file while still providing good detection capabilities
+func computeFastFileHash(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	buf := make([]byte, 1024*1024) // 1MB buffer
+
+	// Read first chunk
+	n, err := io.ReadFull(f, buf)
+	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+		return "", err
+	}
+	if n > 0 {
+		h.Write(buf[:n])
+	}
+
+	// Seek to last chunk if file is larger than 1MB
+	stat, err := f.Stat()
+	if err != nil {
+		return "", err
+	}
+	if stat.Size() > int64(n) {
+		_, err = f.Seek(-int64(len(buf)), io.SeekEnd)
+		// If seeking from end fails (e.g., file is smaller than buffer),
+		// we've already read the whole file in the first chunk
+		if err == nil {
+			n, err = io.ReadFull(f, buf)
+			if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+				return "", err
+			}
+			if n > 0 {
+				h.Write(buf[:n])
+			}
+		}
+	}
+
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
 // isMaliciousHash checks against the *current* set of malicious hashes.
 func isMaliciousHash(hash string) bool {
 	config := GetConfig() // Get a *copy* of the config
@@ -274,7 +327,15 @@ func isMaliciousHash(hash string) bool {
 
 // analyzeFile performs comprehensive file analysis.
 func analyzeFile(ctx context.Context, path string, info os.FileInfo, logger *zap.Logger) (FileEvent, error) {
-	config := GetConfig() // Thread-safe copy of config
+	// Check if context is cancelled
+	select {
+	case <-ctx.Done():
+		return FileEvent{}, ctx.Err()
+	default:
+	}
+
+	// Get the current configuration
+	config := GetConfig()
 
 	event := FileEvent{
 		Path:      path,
@@ -282,74 +343,84 @@ func analyzeFile(ctx context.Context, path string, info os.FileInfo, logger *zap
 		Mode:      info.Mode(),
 		ModTime:   info.ModTime(),
 		Timestamp: time.Now(),
+		User:      getUser(info),
 	}
 
-	// Get user information if possible
-	event.User = getUser(info)
-
-	hash, err := computeFileHash(path)
-	if err != nil {
-		return event, err
-	}
-	event.Hash = hash
-	select {
-	case <-ctx.Done():
-		return event, ctx.Err()
-	default:
-	}
-
-	// Check against known malicious hashes.
-	if isMaliciousHash(hash) {
-		event.Suspicious = true
-		event.Reason = "File hash matches known malicious signature."
-		return event, nil // Early return for clear malicious match
-	}
-	select {
-	case <-ctx.Done():
-		return event, ctx.Err()
-	default:
-	}
-
-	// Check file extension.
-	ext := filepath.Ext(path)
+	// Check if the file is suspicious based on extension
+	ext := strings.ToLower(filepath.Ext(path))
 	for _, suspiciousExt := range config.SuspiciousExtensions {
 		if ext == suspiciousExt {
 			event.Suspicious = true
-			if event.Reason != "" {
-				event.Reason += " and "
-			}
-			event.Reason += "File has a suspicious extension."
+			event.Reason = fmt.Sprintf("Suspicious file extension: %s", ext)
 			break
 		}
 	}
-	select {
-	case <-ctx.Done():
-		return event, ctx.Err()
-	default:
-	}
 
-	// Check file size.
-	if info.Size() > config.MaxSizeThreshold {
+	// Check if the file is suspicious based on size
+	if config.MaxSizeThreshold > 0 && info.Size() > config.MaxSizeThreshold {
 		event.Suspicious = true
-		if event.Reason != "" {
-			event.Reason += " and "
-		}
-		event.Reason += "File size exceeds configured threshold."
+		event.Reason = "File size exceeds configured threshold."
 	}
 
-	// YARA rule matching (if configured).
-	if len(config.YaraRules) > 0 {
-		if yaraMatches, err := matchYaraRules(path, config.YaraRules); err != nil {
-			logger.Error("Error during yara scan", zap.Error(err))
-		} else if len(yaraMatches) > 0 {
+	// Get process information (Linux only)
+	if runtime.GOOS == "linux" {
+		procInfo, err := getProcessForFile(path)
+		if err == nil {
+			event.Process = procInfo.ProcessName
+			event.ParentProcess = procInfo.ProcessName
+			event.PID = procInfo.PID
+			event.PPID = procInfo.PPID
+			event.CmdLine = procInfo.CmdLine
+			event.NetConnections = procInfo.NetConnections
+			logger.Debug("Found process information for file",
+				zap.String("path", path),
+				zap.String("process", event.Process),
+				zap.Int("pid", event.PID))
+		}
+	}
+
+	// Compute file hash (use fast hashing for large files)
+	var hash string
+	var hashErr error
+
+	// Use fast hashing for files larger than 10MB
+	if info.Size() > 10*1024*1024 {
+		logger.Debug("Using fast hash for large file",
+			zap.String("path", path),
+			zap.Int64("size_bytes", info.Size()))
+
+		hash, hashErr = computeFastFileHash(path)
+		if hashErr != nil {
+			logger.Debug("Failed to compute fast hash, falling back to regular hash",
+				zap.String("path", path),
+				zap.Error(hashErr))
+
+			// Fall back to regular hashing if fast hashing fails
+			hash, hashErr = computeFileHash(path)
+		}
+	} else {
+		hash, hashErr = computeFileHash(path)
+	}
+
+	if hashErr != nil {
+		logger.Debug("Failed to compute hash",
+			zap.String("path", path),
+			zap.Error(hashErr))
+
+		// Set a placeholder hash value
+		hash = "hash_computation_failed"
+	} else {
+		// Check if the hash is in the malicious hashes list
+		if isMaliciousHash(hash) {
 			event.Suspicious = true
-			if event.Reason != "" {
-
-				event.Reason += " and "
-			}
-			event.Reason += fmt.Sprintf("File matches YARA rules: %v", yaraMatches)
+			event.Reason = "File hash matches known malicious hash."
+			logger.Warn("Malicious file detected",
+				zap.String("path", path),
+				zap.String("hash", hash))
 		}
 	}
+
+	event.Hash = hash
 
 	return event, nil
 }
@@ -888,25 +959,510 @@ func matchYaraRules(path string, yaraRules []string) ([]string, error) {
 	return matchOSYaraRules(path, yaraRules) // os_specific.go
 }
 
+// --------------------------------------------------------------------------
+// Process Tracking Functions
+// --------------------------------------------------------------------------
+
+// ProcessInfo contains information about a process
+type ProcessInfo struct {
+	PID            int
+	PPID           int
+	ProcessName    string
+	CmdLine        string
+	NetConnections []string
+}
+
+// getProcessForFile attempts to find which process has the file open
+// This works on Linux systems by examining /proc/[pid]/fd
+func getProcessForFile(path string) (ProcessInfo, error) {
+	result := ProcessInfo{}
+
+	// This only works on Linux
+	if runtime.GOOS != "linux" {
+		return result, fmt.Errorf("process tracking only supported on Linux")
+	}
+
+	// Get absolute path for comparison
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return result, err
+	}
+
+	f, err := os.Open("/proc")
+	if err != nil {
+		return result, err
+	}
+	defer f.Close()
+
+	files, err := f.Readdirnames(0)
+	if err != nil {
+		return result, err
+	}
+
+	for _, file := range files {
+		// Only look at directories that are numbers (PIDs)
+		pid, err := strconv.Atoi(file)
+		if err != nil {
+			continue
+		}
+
+		// Check if this process has the file open
+		fdPath := fmt.Sprintf("/proc/%s/fd", file)
+		fds, err := filepath.Glob(fdPath + "/*")
+		if err != nil {
+			continue
+		}
+
+		for _, fd := range fds {
+			target, err := os.Readlink(fd)
+			if err != nil {
+				continue
+			}
+
+			// If this process has the file open
+			if target == absPath {
+				result.PID = pid
+
+				// Get process name from /proc/[pid]/comm
+				if commBytes, err := os.ReadFile(fmt.Sprintf("/proc/%s/comm", file)); err == nil {
+					result.ProcessName = strings.TrimSpace(string(commBytes))
+				}
+
+				// Get command line from /proc/[pid]/cmdline
+				if cmdlineBytes, err := os.ReadFile(fmt.Sprintf("/proc/%s/cmdline", file)); err == nil {
+					// cmdline uses null bytes as separators, replace with spaces for readability
+					cmdline := strings.ReplaceAll(string(cmdlineBytes), "\x00", " ")
+					result.CmdLine = strings.TrimSpace(cmdline)
+				}
+
+				// Get parent PID from /proc/[pid]/status
+				if statusBytes, err := os.ReadFile(fmt.Sprintf("/proc/%s/status", file)); err == nil {
+					statusLines := strings.Split(string(statusBytes), "\n")
+					for _, line := range statusLines {
+						if strings.HasPrefix(line, "PPid:") {
+							ppidStr := strings.TrimSpace(strings.TrimPrefix(line, "PPid:"))
+							if ppid, err := strconv.Atoi(ppidStr); err == nil {
+								result.PPID = ppid
+							}
+							break
+						}
+					}
+				}
+
+				// Get network connections from /proc/[pid]/net/tcp and /proc/[pid]/net/udp
+				// This is a simplified version - a real implementation would parse these files
+				// to extract actual connection information
+				result.NetConnections = getNetworkConnections(pid)
+
+				return result, nil
+			}
+		}
+	}
+
+	return result, fmt.Errorf("no process found for file")
+}
+
+// getNetworkConnections returns a list of network connections for a process
+func getNetworkConnections(pid int) []string {
+	var connections []string
+
+	// Read TCP connections
+	if tcpBytes, err := os.ReadFile(fmt.Sprintf("/proc/%d/net/tcp", pid)); err == nil {
+		tcpLines := strings.Split(string(tcpBytes), "\n")
+		// Skip header line
+		for i := 1; i < len(tcpLines); i++ {
+			line := strings.TrimSpace(tcpLines[i])
+			if line == "" {
+				continue
+			}
+
+			// Parse the line to extract connection information
+			// Format: sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode
+			fields := strings.Fields(line)
+			if len(fields) < 4 {
+				continue
+			}
+
+			// Extract local and remote addresses
+			localAddr := parseHexAddress(fields[1])
+			remoteAddr := parseHexAddress(fields[2])
+
+			connections = append(connections, fmt.Sprintf("TCP %s -> %s", localAddr, remoteAddr))
+		}
+	}
+
+	// Read UDP connections
+	if udpBytes, err := os.ReadFile(fmt.Sprintf("/proc/%d/net/udp", pid)); err == nil {
+		udpLines := strings.Split(string(udpBytes), "\n")
+		// Skip header line
+		for i := 1; i < len(udpLines); i++ {
+			line := strings.TrimSpace(udpLines[i])
+			if line == "" {
+				continue
+			}
+
+			// Parse the line to extract connection information
+			fields := strings.Fields(line)
+			if len(fields) < 4 {
+				continue
+			}
+
+			// Extract local and remote addresses
+			localAddr := parseHexAddress(fields[1])
+
+			connections = append(connections, fmt.Sprintf("UDP %s", localAddr))
+		}
+	}
+
+	return connections
+}
+
+// parseHexAddress converts a hex address from /proc/net/tcp or /proc/net/udp to a human-readable format
+func parseHexAddress(hexAddr string) string {
+	parts := strings.Split(hexAddr, ":")
+	if len(parts) != 2 {
+		return hexAddr
+	}
+
+	// Convert hex IP to decimal
+	ipHex := parts[0]
+	if len(ipHex) != 8 {
+		return hexAddr
+	}
+
+	// IP address is stored in little-endian format
+	ip := net.IP{
+		byte(mustParseUint(ipHex[6:8], 16)),
+		byte(mustParseUint(ipHex[4:6], 16)),
+		byte(mustParseUint(ipHex[2:4], 16)),
+		byte(mustParseUint(ipHex[0:2], 16)),
+	}
+
+	// Convert hex port to decimal
+	port := mustParseUint(parts[1], 16)
+
+	return fmt.Sprintf("%s:%d", ip.String(), port)
+}
+
+// mustParseUint parses a hex string to uint64 or returns 0 if there's an error
+func mustParseUint(s string, base int) uint64 {
+	v, err := strconv.ParseUint(s, base, 64)
+	if err != nil {
+		return 0
+	}
+	return v
+}
+
+// --------------------------------------------------------------------------
+// Real-time File Monitoring
+// --------------------------------------------------------------------------
+
+// FileMonitorOptions contains options for real-time file monitoring
+type FileMonitorOptions struct {
+	Paths           []string        // Paths to monitor
+	RecursiveWatch  bool            // Whether to watch directories recursively
+	EventHandler    func(FileEvent) // Function to call when a file event is detected
+	ExcludePaths    []string        // Paths to exclude from monitoring
+	IncludePatterns []string        // File patterns to include (e.g., "*.exe")
+	ExcludePatterns []string        // File patterns to exclude
+	Logger          *zap.Logger     // Logger to use
+}
+
+// FileMonitor represents a real-time file monitor
+type FileMonitor struct {
+	watcher       *fsnotify.Watcher
+	options       FileMonitorOptions
+	watchedPaths  map[string]bool
+	excludedPaths map[string]bool
+	ctx           context.Context
+	cancel        context.CancelFunc
+	wg            sync.WaitGroup
+	logger        *zap.Logger
+}
+
+// NewFileMonitor creates a new file monitor
+func NewFileMonitor(options FileMonitorOptions) (*FileMonitor, error) {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create watcher: %w", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	logger := options.Logger
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+
+	monitor := &FileMonitor{
+		watcher:       watcher,
+		options:       options,
+		watchedPaths:  make(map[string]bool),
+		excludedPaths: make(map[string]bool),
+		ctx:           ctx,
+		cancel:        cancel,
+		logger:        logger,
+	}
+
+	// Precompute excluded paths
+	for _, path := range options.ExcludePaths {
+		absPath, err := filepath.Abs(path)
+		if err == nil {
+			monitor.excludedPaths[absPath] = true
+		}
+	}
+
+	return monitor, nil
+}
+
+// Start starts the file monitor
+func (m *FileMonitor) Start() error {
+	// Add initial paths to watch
+	for _, path := range m.options.Paths {
+		if err := m.addWatchPath(path); err != nil {
+			return err
+		}
+	}
+
+	// Start the event processing goroutine
+	m.wg.Add(1)
+	go m.processEvents()
+
+	return nil
+}
+
+// Stop stops the file monitor
+func (m *FileMonitor) Stop() {
+	m.cancel()
+	m.watcher.Close()
+	m.wg.Wait()
+}
+
+// addWatchPath adds a path to the watcher
+func (m *FileMonitor) addWatchPath(path string) error {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return fmt.Errorf("failed to get absolute path: %w", err)
+	}
+
+	// Skip if already watched or excluded
+	if m.watchedPaths[absPath] || m.excludedPaths[absPath] {
+		return nil
+	}
+
+	// Check if the path exists
+	info, err := os.Stat(absPath)
+	if err != nil {
+		return fmt.Errorf("failed to stat path: %w", err)
+	}
+
+	// If it's a directory and recursive watching is enabled, add all subdirectories
+	if info.IsDir() && m.options.RecursiveWatch {
+		err := filepath.Walk(absPath, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+
+			if info.IsDir() {
+				dirPath, err := filepath.Abs(path)
+				if err != nil {
+					return err
+				}
+
+				// Skip if excluded
+				if m.excludedPaths[dirPath] {
+					return filepath.SkipDir
+				}
+
+				// Skip if already watched
+				if m.watchedPaths[dirPath] {
+					return nil
+				}
+
+				// Add to watcher
+				if err := m.watcher.Add(dirPath); err != nil {
+					m.logger.Error("Failed to watch directory",
+						zap.String("path", dirPath),
+						zap.Error(err))
+					return nil // Continue even if we can't watch this directory
+				}
+
+				m.watchedPaths[dirPath] = true
+				m.logger.Debug("Watching directory", zap.String("path", dirPath))
+			}
+
+			return nil
+		})
+
+		if err != nil {
+			return fmt.Errorf("failed to walk directory: %w", err)
+		}
+	} else {
+		// Add the path to the watcher
+		if err := m.watcher.Add(absPath); err != nil {
+			return fmt.Errorf("failed to watch path: %w", err)
+		}
+
+		m.watchedPaths[absPath] = true
+		m.logger.Debug("Watching path", zap.String("path", absPath))
+	}
+
+	return nil
+}
+
+// processEvents processes events from the watcher
+func (m *FileMonitor) processEvents() {
+	defer m.wg.Done()
+
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+
+		case event, ok := <-m.watcher.Events:
+			if !ok {
+				return
+			}
+
+			// Skip directories for file operations
+			info, err := os.Stat(event.Name)
+			if err == nil && info.IsDir() {
+				// If a new directory is created and we're watching recursively, add it
+				if event.Op&fsnotify.Create == fsnotify.Create && m.options.RecursiveWatch {
+					m.addWatchPath(event.Name)
+				}
+				continue
+			}
+
+			// Check if the file matches include/exclude patterns
+			if !m.shouldProcessFile(event.Name) {
+				continue
+			}
+
+			// Process the file event
+			if event.Op&(fsnotify.Write|fsnotify.Create) != 0 {
+				m.logger.Debug("File modified or created",
+					zap.String("path", event.Name),
+					zap.String("operation", event.Op.String()))
+
+				// Analyze the file
+				if info != nil {
+					fileEvent, err := analyzeFile(m.ctx, event.Name, info, m.logger)
+					if err != nil {
+						m.logger.Error("Failed to analyze file",
+							zap.String("path", event.Name),
+							zap.Error(err))
+						continue
+					}
+
+					// Perform behavioral analysis
+					AnalyzeBehavior(fileEvent, m.logger)
+
+					// Call the event handler if provided
+					if m.options.EventHandler != nil {
+						m.options.EventHandler(fileEvent)
+					}
+
+					// If the file is suspicious, add it to the alerts
+					if fileEvent.Suspicious {
+						addAlert(fileEvent)
+						m.logger.Warn("Suspicious file detected",
+							zap.String("path", fileEvent.Path),
+							zap.String("reason", fileEvent.Reason),
+							zap.String("process", fileEvent.Process),
+							zap.Int("pid", fileEvent.PID))
+					}
+				}
+			}
+
+		case err, ok := <-m.watcher.Errors:
+			if !ok {
+				return
+			}
+			m.logger.Error("Watcher error", zap.Error(err))
+		}
+	}
+}
+
+// shouldProcessFile checks if a file should be processed based on include/exclude patterns
+func (m *FileMonitor) shouldProcessFile(path string) bool {
+	// Check exclude paths
+	absPath, err := filepath.Abs(path)
+	if err == nil && m.excludedPaths[absPath] {
+		return false
+	}
+
+	// Check exclude patterns
+	for _, pattern := range m.options.ExcludePatterns {
+		matched, err := filepath.Match(pattern, filepath.Base(path))
+		if err == nil && matched {
+			return false
+		}
+	}
+
+	// If include patterns are specified, check if the file matches any
+	if len(m.options.IncludePatterns) > 0 {
+		for _, pattern := range m.options.IncludePatterns {
+			matched, err := filepath.Match(pattern, filepath.Base(path))
+			if err == nil && matched {
+				return true
+			}
+		}
+		return false // No include pattern matched
+	}
+
+	// No include patterns specified, so include all files that weren't excluded
+	return true
+}
+
+// MonitorDirectories starts real-time monitoring of directories
+func MonitorDirectories(ctx context.Context, paths []string, recursive bool, eventHandler func(FileEvent), logger *zap.Logger) (*FileMonitor, error) {
+	options := FileMonitorOptions{
+		Paths:          paths,
+		RecursiveWatch: recursive,
+		EventHandler:   eventHandler,
+		Logger:         logger,
+	}
+
+	monitor, err := NewFileMonitor(options)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := monitor.Start(); err != nil {
+		monitor.Stop()
+		return nil, err
+	}
+
+	// Stop the monitor when the context is done
+	go func() {
+		<-ctx.Done()
+		monitor.Stop()
+	}()
+
+	return monitor, nil
+}
+
 // -------- Main Function & Startup Logic ---------
 
 func Start(rootDir, configFile, httpAddr, authUser, authPassword string, concurrency int) {
-
-	// Load configuration
-	if err := LoadConfig(configFile); err != nil {
-		//if no config is loaded exit
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
-	}
-
-	//Create the application logger
-	logger := createLogger(LogLevelInfo, GetConfig().LogFilePath)
+	// Initialize logger
+	logger := createLogger(LogLevelInfo, "")
 	defer logger.Sync()
 
-	// Start threat feed updates (if configured).  Run in background.
+	// Load configuration
+	if configFile != "" {
+		if err := LoadConfig(configFile); err != nil {
+			logger.Fatal("Failed to load configuration", zap.Error(err))
+		}
+	}
 
+	// Start behavioral monitoring
+	StartBehavioralMonitoring(logger)
+	logger.Info("Behavioral monitoring initialized")
+
+	// Start threat feed updates (if configured)
 	if GetConfig().ThreatFeedURL != "" {
-
 		go func() {
 			// Initial fetch
 			if err := updateThreatFeed(logger); err != nil {
@@ -922,61 +1478,100 @@ func Start(rootDir, configFile, httpAddr, authUser, authPassword string, concurr
 		}()
 	}
 
-	// Set up context for graceful shutdown.
+	// Start HTTP server if address is provided
+	if httpAddr != "" {
+		go func() {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/alerts", BasicAuthMiddleware(alertsHandler, authUser, authPassword))
+
+			// Add behavioral alerts endpoint
+			mux.HandleFunc("/behavioral-alerts", BasicAuthMiddleware(func(w http.ResponseWriter, r *http.Request) {
+				alerts := GetBehavioralAlerts()
+				w.Header().Set("Content-Type", "application/json")
+				if err := json.NewEncoder(w).Encode(alerts); err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+				}
+			}, authUser, authPassword))
+
+			logger.Info("Starting HTTP server", zap.String("address", httpAddr))
+			if err := http.ListenAndServe(httpAddr, mux); err != nil {
+				logger.Fatal("HTTP server failed", zap.Error(err))
+			}
+		}()
+	}
+
+	// Set up signal handling for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Start file system traversal
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	go func() {
-		opts := WalkOptions{
-			BufferSize:      concurrency,
-			ErrorHandling:   ErrorHandlingContinue,
-			Filter:          FilterOptions{}, // Add any default filters
-			Logger:          logger,
-			LogLevel:        LogLevelInfo,
-			SymlinkHandling: SymlinkFollow, // Or your preferred default
-		}
-
-		err := WalkLimitWithOptions(ctx, rootDir, func(path string, info os.FileInfo, err error) error {
-			// This walk function is now *very* minimal - just logging.
-			if err == nil && info != nil && !info.IsDir() {
-				//Removed the file processing
-				logger.Debug("Processed file", zap.String("path", path))
-			}
-			return nil
-		}, opts) // Now using options
-
-		if err != nil {
-			logger.Error("File traversal error", zap.Error(err))
-		}
+		<-sigCh
+		logger.Info("Received shutdown signal")
+		cancel()
 	}()
 
-	// Start HTTP server (with basic auth)
-	http.HandleFunc("/alerts", BasicAuthMiddleware(alertsHandler, authUser, authPassword))
-	server := &http.Server{Addr: httpAddr}
+	// Start the file walker
+	logger.Info("Starting file walker", zap.String("root", rootDir), zap.Int("concurrency", concurrency))
 
-	go func() {
-		logger.Info("Starting HTTP server", zap.String("address", httpAddr))
-		if err := server.ListenAndServe(); err != http.ErrServerClosed {
-			logger.Error("HTTP server error", zap.Error(err))
-		}
-	}()
-
-	// Block until interrupt (Ctrl+C)
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt) // More portable signal handling
-
-	<-sigChan // Block until signal received
-	logger.Info("Shutting down...")
-
-	// Graceful shutdown of HTTP server
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second) // Timeout for graceful shutdown
-	defer shutdownCancel()
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		logger.Error("Error during server shutdown", zap.Error(err))
+	// Create a progress function to log statistics
+	progressFn := func(stats Stats) {
+		logger.Info("Progress",
+			zap.Int64("files", stats.FilesProcessed),
+			zap.Int64("dirs", stats.DirsProcessed),
+			zap.Int64("bytes", stats.BytesProcessed),
+			zap.Float64("MB/s", stats.SpeedMBPerSec),
+			zap.Duration("elapsed", stats.ElapsedTime))
 	}
 
-	cancel() // Signal file traversal to stop
-	logger.Info("Shutdown complete.")
+	// Create options for the walker
+	opts := WalkOptions{
+		ErrorHandling:   ErrorHandlingContinue,
+		Progress:        progressFn,
+		Logger:          logger,
+		LogLevel:        LogLevelInfo,
+		BufferSize:      concurrency * 100, // Buffer 100 items per worker
+		SymlinkHandling: SymlinkReport,
+	}
 
+	// Define the walk function
+	walkFn := func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			logger.Error("Error accessing path", zap.String("path", path), zap.Error(err))
+			return nil // Continue on error
+		}
+
+		// Skip directories
+		if info.IsDir() {
+			return nil
+		}
+
+		// Analyze the file
+		fileEvent, err := analyzeFile(ctx, path, info, logger)
+		if err != nil {
+			logger.Error("Failed to analyze file", zap.String("path", path), zap.Error(err))
+			return nil
+		}
+
+		// Perform behavioral analysis on the file event
+		AnalyzeBehavior(fileEvent, logger)
+
+		// If the file is suspicious, add it to the alerts
+		if fileEvent.Suspicious {
+			addAlert(fileEvent)
+			logger.Warn("Suspicious file detected",
+				zap.String("path", fileEvent.Path),
+				zap.String("reason", fileEvent.Reason))
+		}
+
+		return nil
+	}
+
+	// Start the walk
+	if err := WalkLimitWithOptions(ctx, rootDir, walkFn, opts); err != nil && err != context.Canceled {
+		logger.Error("Walk failed", zap.Error(err))
+	}
+
+	logger.Info("File walker completed")
 }
