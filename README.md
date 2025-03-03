@@ -37,16 +37,23 @@ Errors are collected using `errors.Join()`, allowing detailed reporting.
 
 ## 📈 Performance
 
-Filewalker significantly outperforms `filepath.Walk` by using concurrent workers.
+>Benchmarks run on Apple M2 Pro with Go 1.24.
 
-| Workers  | Time (ns/op)  | Throughput (MB/s) | Speedup |
-|----------|-------------|----------------|---------|
-| `filepath.Walk` | 3,192,416,229 | ~54 MB/s  | baseline |
-| **2 workers**   | 1,557,652,298 | ~110 MB/s | 2.05x faster |
-| **4 workers**   | 768,225,614   | ~225 MB/s | 4.21x faster |
-| **8 workers**   | 372,091,401   | ~465 MB/s | 8.65x faster |
+Filewalker significantly outperforms `filepath.Walk` by using concurrent workers:
 
-> Benchmarks run on Apple M2 Pro (10 cores)
+| Workers | Time (ns/op) | Memory (B/op) | Allocs/op | Speedup |
+|---------|-------------|---------------|------------|---------|
+| `filepath.Walk` | 2,980,779,125 | 4,217,888 | 26,152 | baseline |
+| **2 workers** | 1,436,847,583 | 4,683,048 | 26,213 | 2.07x faster |
+| **4 workers** | 722,509,938 | 4,682,936 | 26,208 | 4.13x faster |
+| **8 workers** | 360,482,125 | 4,684,189 | 26,210 | 8.27x faster |
+
+### 🛠 **Benchmark Analysis**
+
+- **Speed**: Up to 8.27x faster with 8 workers
+- **Memory**: Consistent ~4.6MB memory usage across worker counts
+- **Allocations**: Minimal overhead (~60 extra allocs) vs standard library
+- **Scaling**: Near-linear performance scaling with worker count
 
 ### 🛠 **Benchmark Setup**
 
